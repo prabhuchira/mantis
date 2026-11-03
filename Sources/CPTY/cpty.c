@@ -22,7 +22,6 @@ pid_t cpty_spawn(const char *path, char *const argv[], char *const envp[],
 
     int master = -1;
     // forkpty = openpty + fork + login_tty (setsid, TIOCSCTTY, dup2 0/1/2).
-    // Ghostty does the same steps by hand in src/pty.zig (openpty/setsid/TIOCSCTTY).
     pid_t pid = forkpty(&master, NULL, NULL, &ws);
     if (pid < 0) return -1;
 

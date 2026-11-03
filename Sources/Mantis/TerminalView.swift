@@ -2,12 +2,40 @@ import AppKit
 import CoreText
 import MantisCore
 
-/// One terminal "surface" (Ghostty: src/Surface.zig + macos SurfaceView_AppKit.swift).
+/// Text layer: draws the cell grid on a transparent background, above the effect layer.
+final class GridView: NSView {
+    weak var owner: TerminalView?
+    // Any redraw of the text layer also redraws the GPU layer beneath it (when active).
+    override func setNeedsDisplay(_ r: NSRect) { super.setNeedsDisplay(r); owner?.metalView?.dirty = true }
+    override var needsDisplay: Bool {
+        get { super.needsDisplay }
+        set { super.needsDisplay = newValue; if newValue { owner?.metalView?.dirty = true } }
+    }
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        owner?.metalView?.renderIfNeeded() // GPU text beneath, presented with this transaction
+        owner?.drawGrid(dirtyRect)
+    }
+}
+
+/// One terminal "surface".
 /// Owns a Terminal + PTYProcess, renders the grid, and translates AppKit input.
+///
+/// Layer stack (bottom → top):  self (background + badge) → EffectView → GridView (text)
+/// [→ EffectView again for overlay effects such as CRT] → search field.
+/// Effects animate on their own layer, so the text is not re-rendered every frame.
 final class TerminalView: NSView, NSTextInputClient {
-    let config: Config
+    private(set) var config: Config
     let terminal: Terminal
     let pty: PTYProcess
+    let gridView = GridView()
+    /// GPU renderer for backgrounds + glyphs (nil = CoreGraphics draws everything).
+    private(set) var metalView: MetalGridView?
+    /// Bumped when fonts change, so the GPU glyph atlas is rebuilt.
+    private(set) var fontGeneration = 0
+    let effectView = EffectView(frame: .zero)
 
     // Font & metrics
     private var fontSize: CGFloat
@@ -34,6 +62,32 @@ final class TerminalView: NSView, NSTextInputClient {
     private let redrawLock = NSLock()
     private var redrawPending = false
 
+    // Render caches (see drawGrid / invalidateChangedRows)
+    private var asciiGlyphs: [[CGGlyph]] = []              // [style][byte] → glyph (0 = missing)
+    private var glyphLineCache: [String: (CTLine, CGFloat)] = [:] // non-ASCII glyphs, colored from context
+    private var colorCache: [RGB: CGColor] = [:]
+    private var ruleCache: [Int: (Row, [RGB?])] = [:]      // highlight-rule results by stable line
+    private var glyphBuf: [CGGlyph] = [], posBuf: [CGPoint] = []
+    /// What is currently on screen, so output only redraws the rows that changed.
+    private struct Drawn: Equatable {
+        var rows: [Row] = []
+        var firstStable = -1, cols = 0
+        var cursor: Int? = nil
+        var cursorShape: Terminal.CursorShape? = nil
+        var marks: [UUID] = []
+        var reverse = false
+        var colors: [RGB] = []
+        func sameFrame(as o: Drawn) -> Bool {
+            firstStable == o.firstStable && cols == o.cols && rows.count == o.rows.count
+                && marks == o.marks && reverse == o.reverse && colors == o.colors
+        }
+    }
+    private var drawn = Drawn()
+    /// Number of rows redrawn by the last output-driven invalidation (for tests/benchmarks).
+    private(set) var lastDirtyRowCount = 0
+    /// Number of rows actually painted by the last drawGrid call.
+    private(set) var lastPaintedRowCount = 0
+
     // Search (Cmd+F)
     private var searchField: NSSearchField?
     private var searchMatches: [Selection] = []
@@ -53,6 +107,8 @@ final class TerminalView: NSView, NSTextInputClient {
     var trailStart = Date.distantPast
     var lastCursorRect: CGRect?
     var trailTimer: Timer?
+    var annotations = AnnotationStore()   // session highlights (TerminalView+Highlights.swift)
+    var markerColor = 0
 
     var onTitle: ((String) -> Void)?
     var onCwd: ((String) -> Void)?
@@ -68,8 +124,145 @@ final class TerminalView: NSView, NSTextInputClient {
         config.apply(to: terminal)
         wantsLayer = true
         layerContentsRedrawPolicy = .onSetNeedsDisplay
+        for v in [effectView, gridView] as [NSView] {
+            v.frame = bounds
+            v.autoresizingMask = [.width, .height]
+            v.wantsLayer = true
+            v.layerContentsRedrawPolicy = .onSetNeedsDisplay
+            addSubview(v)
+        }
+        gridView.owner = self
+        installRenderer()
+        installEffect()
         updateFonts()
         wireTerminal()
+    }
+
+    // Redraw requests target the text layer; the background is redrawn only when it can change.
+    override var needsDisplay: Bool {
+        get { super.needsDisplay }
+        set { gridView.needsDisplay = newValue }
+    }
+    override func setNeedsDisplay(_ invalidRect: NSRect) { gridView.setNeedsDisplay(invalidRect) }
+    func redrawAll() { super.needsDisplay = true; gridView.needsDisplay = true }
+
+    /// Live-apply settings. Process-launch settings (command, cwd) stay with the running shell.
+    func applyConfig(_ incoming: Config) {
+        var new = incoming
+        new.command = config.command
+        new.waitAfterCommand = config.waitAfterCommand
+        new.workingDirectory = config.workingDirectory
+        let fontChanged = new.fontFamily != config.fontFamily || new.fontSize != config.fontSize
+        config = new
+        ruleCache.removeAll()
+        terminal.lock.lock(); new.apply(to: terminal); terminal.lock.unlock()
+        if fontChanged { fontSize = new.fontSize; updateFonts() }
+        updateGrid()
+        installRenderer()
+        installEffect()
+        redrawAll()
+    }
+
+    private func installEffect() {
+        effectView.configure(config.effectSettings)
+        guard let ei = subviews.firstIndex(of: effectView), let gi = subviews.firstIndex(of: gridView) else { return }
+        let wantAbove = config.effect.isOverlay
+        // Background effects go beneath both text layers (Metal and CoreGraphics).
+        let bottomText: NSView = metalView ?? gridView
+        let bi = subviews.firstIndex(of: bottomText) ?? gi
+        if wantAbove ? ei < gi : ei > bi {
+            effectView.removeFromSuperview()
+            addSubview(effectView, positioned: wantAbove ? .above : .below, relativeTo: wantAbove ? gridView : bottomText)
+        }
+    }
+
+    /// Switch between the Metal and CoreGraphics renderers (falls back if Metal is unavailable).
+    private func installRenderer() {
+        let want = config.renderer == .metal
+        if want, metalView == nil, let mv = MetalGridView(owner: self) {
+            mv.frame = bounds
+            addSubview(mv, positioned: .below, relativeTo: gridView)
+            metalView = mv
+        } else if !want, let mv = metalView {
+            mv.removeFromSuperview()
+            metalView = nil
+        }
+        redrawAll()
+    }
+
+    /// Quads for one GPU frame: background runs and glyphs, with the same colors the
+    /// CoreGraphics path would use (see resolveRow).
+    func buildGPUQuads(atlas: GlyphAtlas) -> [GPUQuad] {
+        let s = snapshot()
+        terminal.lock.lock()
+        let marks = annotations.isEmpty ? [] : annotations.live(in: terminal)
+        terminal.lock.unlock()
+        let cc = colorContext(s, marks: marks)
+        var quads: [GPUQuad] = []
+        quads.reserveCapacity(s.cols * s.rows.count / 2 + 64)
+        func f4(_ c: RGB, _ a: CGFloat = 1) -> SIMD4<Float> { SIMD4(Float(c.r) / 255, Float(c.g) / 255, Float(c.b) / 255, Float(a)) }
+        func solid(_ r: CGRect, _ c: RGB, _ a: CGFloat = 1) {
+            quads.append(GPUQuad(rect: SIMD4(Float(r.minX), Float(r.minY), Float(r.width), Float(r.height)), uv: .zero, color: f4(c, a), kind: 0))
+        }
+        if s.reverse { solid(bounds, s.fg, config.backgroundOpacity) } // DECSCNM: whole background flips
+        let cell = CGSize(width: cellW, height: cellH)
+        for (r, row) in s.rows.enumerated() {
+            let y = padY + CGFloat(r) * cellH
+            let n = min(row.cells.count, s.cols)
+            let (fgs, bgs) = resolveRow(row, stable: s.firstStable + r, n: n, cc)
+            var x = 0
+            while x < n { // background runs, edge cells extended into the padding
+                guard let bg = bgs[x] else { x += 1; continue }
+                var e = x + 1
+                while e < n, bgs[e] == bg { e += 1 }
+                let x0 = x == 0 ? 0 : padX + CGFloat(x) * cellW
+                let x1 = e == s.cols ? bounds.width : padX + CGFloat(e) * cellW
+                solid(CGRect(x: x0, y: y, width: x1 - x0, height: cellH), bg)
+                x = e
+            }
+            for x in 0..<n {
+                let c = row.cells[x]
+                if c.width == 0 || c.isSpace || c.attrs.contains(.hidden) { continue }
+                let style = fontIndex(c.attrs)
+                let e = atlas.entry(GlyphKey(code: c.code, style: UInt8(style), width: c.width), cellSize: cell) { ctx, rect in
+                    self.rasterizeGlyph(ctx, code: c.code, style: style, rect: rect)
+                }
+                if e.empty { continue }
+                let gx = padX + CGFloat(x) * cellW + e.offset.x, gy = y + e.offset.y
+                quads.append(GPUQuad(rect: SIMD4(Float(gx), Float(gy), Float(e.size.width), Float(e.size.height)),
+                                     uv: e.uv, color: f4(fgs[x]), kind: e.colored ? 2 : 1))
+            }
+        }
+        return quads
+    }
+
+    /// Draw one glyph in white (for tinting on the GPU) into `rect` of a flipped context,
+    /// using exactly the CoreGraphics renderer's glyph paths.
+    func rasterizeGlyph(_ ctx: CGContext, code: UInt32, style: Int, rect: CGRect) {
+        let white = RGB(255, 255, 255)
+        if code > 0x20, code < 0x80, asciiGlyphs.indices.contains(style) {
+            var g = asciiGlyphs[style][Int(code)]
+            if g != 0 {
+                var pos = CGPoint(x: rect.minX, y: -(rect.minY + ascent))
+                ctx.textPosition = .zero
+                ctx.setFillColor(cgColor(white))
+                CTFontDrawGlyphs(fonts[style], &g, &pos, 1, ctx)
+                return
+            }
+        }
+        let ch = Graphemes.decode(code)
+        if !drawSprite(ctx, ch, rect: rect, color: white) {
+            drawCentered(ctx, String(ch), font: fonts[style], color: white, rect: rect)
+        }
+    }
+
+    /// Background layer: default background color + badge.
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.clear(bounds)
+        ctx.setFillColor(config.background.nsColor.withAlphaComponent(config.backgroundOpacity).cgColor)
+        ctx.fill(bounds)
+        drawBadge(ctx, fg: config.foreground)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -87,7 +280,7 @@ final class TerminalView: NSView, NSTextInputClient {
 
     private func wireTerminal() {
         terminal.onResponse = { [weak self] bytes in self?.pty.write(bytes) }
-        terminal.onTitle = { [weak self] t in DispatchQueue.main.async { self?.onTitle?(t) } }
+        terminal.onTitle = { [weak self] t in DispatchQueue.main.async { self?.onTitle?(t); if self?.config.badge != nil { self?.redrawAll() } } }
         terminal.onWorkingDirectory = { [weak self] d in DispatchQueue.main.async { self?.onCwd?(d) } }
         terminal.onBell = { [weak self] in DispatchQueue.main.async { self?.bell() } }
         terminal.onClipboardWrite = { text in
@@ -142,6 +335,14 @@ final class TerminalView: NSView, NSTextInputClient {
             CTFontGetAdvancesForGlyphs(f, .horizontal, &g, &a, 1)
             return cellW - a.width
         }
+        asciiGlyphs = fonts.map { f in
+            var chars = (0..<128).map { UniChar($0) }
+            var glyphs = [CGGlyph](repeating: 0, count: 128)
+            CTFontGetGlyphsForCharacters(f, &chars, &glyphs, 128)
+            return glyphs
+        }
+        glyphLineCache.removeAll()
+        fontGeneration &+= 1
         ascent = ceil(base.ascender)
         cellH = ceil(base.ascender - base.descender + base.leading)
         if let w = window { w.contentResizeIncrements = NSSize(width: cellW, height: cellH) }
@@ -169,7 +370,7 @@ final class TerminalView: NSView, NSTextInputClient {
         needsDisplay = true
     }
 
-    /// Coalesce redraw requests from the IO thread (Ghostty wakes its renderer thread via an xev.Async).
+    /// Coalesce redraw requests from the IO thread.
     private func scheduleRedraw() {
         redrawLock.lock()
         if redrawPending { redrawLock.unlock(); return }
@@ -180,8 +381,55 @@ final class TerminalView: NSView, NSTextInputClient {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.redrawLock.lock(); self.redrawPending = false; self.redrawLock.unlock()
-            self.needsDisplay = true
+            self.invalidateChangedRows()
         }
+    }
+
+    /// Output-driven redraw: compare the terminal with what is on screen and invalidate
+    /// only the rows that differ (plus old/new cursor rows). Anything that shifts the
+    /// whole frame (scrolling, resize, palette, highlights appearing/vanishing) redraws all.
+    func invalidateChangedRows() {
+        let now = currentFrame()
+        guard now.sameFrame(as: drawn) else { lastDirtyRowCount = now.rows.count; needsDisplay = true; return }
+        var dirty = IndexSet()
+        for r in now.rows.indices where now.rows[r] != drawn.rows[r] { dirty.insert(r) }
+        if now.cursor != drawn.cursor || now.cursorShape != drawn.cursorShape {
+            for r in [now.cursor, drawn.cursor].compactMap({ $0 }) { dirty.insert(r) }
+        }
+        lastDirtyRowCount = dirty.count
+        for r in dirty { gridView.setNeedsDisplay(rowRect(r, count: now.rows.count)) }
+    }
+
+    private func currentFrame() -> Drawn {
+        terminal.lock.lock(); defer { terminal.lock.unlock() }
+        let t = terminal
+        let cy = t.cursorY + t.scrollOffset
+        return Drawn(rows: (0..<t.rows).map { t.viewportRow($0) },
+                     firstStable: t.droppedLines + t.absIndex(viewportRow: 0), cols: t.cols,
+                     cursor: t.modes.cursorVisible && cy < t.rows ? cy : nil, cursorShape: t.cursorShape,
+                     marks: annotations.isEmpty ? [] : annotations.live(in: t).map(\.id),
+                     reverse: t.modes.reverseVideo, colors: [t.defaultFG, t.defaultBG, t.cursorColor] + t.palette)
+    }
+
+    /// A row's strip in grid coordinates; edge rows extend into the padding.
+    private func rowRect(_ r: Int, count: Int) -> NSRect {
+        let y0 = r == 0 ? 0 : padY + CGFloat(r) * cellH
+        let y1 = r == count - 1 ? gridView.bounds.height : padY + CGFloat(r + 1) * cellH
+        return NSRect(x: 0, y: y0, width: gridView.bounds.width, height: y1 - y0)
+    }
+
+    private func cgColor(_ c: RGB) -> CGColor {
+        if let k = colorCache[c] { return k }
+        if colorCache.count > 4096 { colorCache.removeAll() }
+        let k = c.cgColor; colorCache[c] = k; return k
+    }
+
+    private func ruleColors(_ row: Row, stable: Int) -> [RGB?] {
+        if let (r, v) = ruleCache[stable], r == row { return v }
+        let v = HighlightRule.apply(config.highlights, to: row)
+        if ruleCache.count > 8192 { ruleCache.removeAll() }
+        ruleCache[stable] = (row, v)
+        return v
     }
 
     // MARK: - Rendering
@@ -195,7 +443,7 @@ final class TerminalView: NSView, NSTextInputClient {
         return NSRect(x: padX + CGFloat(terminal.cursorX) * cellW, y: padY + CGFloat(y) * cellH, width: cellW * 2, height: cellH)
     }
 
-    private struct Snapshot {
+    struct Snapshot {
         var rows: [Row]
         var cols: Int
         var cursor: (x: Int, y: Int)?
@@ -208,7 +456,7 @@ final class TerminalView: NSView, NSTextInputClient {
         var hyperlinks: [String]
     }
 
-    private func snapshot() -> Snapshot {
+    func snapshot() -> Snapshot {
         terminal.lock.lock(); defer { terminal.lock.unlock() }
         let t = terminal
         let rows = (0..<t.rows).map { t.viewportRow($0) }
@@ -230,57 +478,105 @@ final class TerminalView: NSView, NSTextInputClient {
         }
     }
 
-    override func draw(_ dirtyRect: NSRect) {
+    /// Everything that affects a cell's final colors besides the cell itself.
+    struct ColorContext {
+        var s: Snapshot
+        var marks: [Annotation]
+        var selBG: RGB, matchBG: RGB, currentMatchBG: RGB
+        var currentMatch: Selection?
+    }
+
+    func colorContext(_ s: Snapshot, marks: [Annotation]) -> ColorContext {
+        ColorContext(s: s, marks: marks, selBG: config.selectionBackground,
+                     matchBG: RGB(0x6B, 0x55, 0x1E), currentMatchBG: RGB(0xC9, 0x8E, 0x1A),
+                     currentMatch: searchMatches.indices.contains(searchIndex) ? searchMatches[searchIndex] : nil)
+    }
+
+    /// Final per-cell colors for one row (shared by the CoreGraphics and Metal renderers):
+    /// SGR colors, inverse/bold/dim/hidden, highlight rules, selection, search, marker
+    /// highlights and minimum contrast. `bgs[x] == nil` means the default background.
+    func resolveRow(_ row: Row, stable: Int, n: Int, _ cc: ColorContext) -> (fgs: [RGB], bgs: [RGB?]) {
+        let s = cc.s
+        let rowMarks = cc.marks.filter { $0.range.start.line <= stable && $0.range.end.line >= stable }
+        var fgs = [RGB](repeating: s.fg, count: n)
+        var bgs = [RGB?](repeating: nil, count: n)
+        let highlights = config.highlights.isEmpty ? nil : ruleColors(row, stable: stable)
+        let rowSelected = selection.map { $0.start.line <= stable && $0.end.line >= stable } ?? false
+        let rowMatches = searchMatches.isEmpty ? [] : searchMatches.filter { $0.start.line <= stable && $0.end.line >= stable }
+        for x in 0..<n {
+            let c = row.cells[x]
+            var fg = resolve(c.fg, s, fg: true), bg = resolve(c.bg, s, fg: false)
+            var bgIsDefault = c.bg == .default
+            if c.attrs.contains(.inverse) != s.reverse { swap(&fg, &bg); bgIsDefault = false }
+            if c.attrs.contains(.bold), case .indexed(let i) = c.fg, i < 8 { fg = s.palette[Int(i) + 8] } // bold-is-bright
+            if c.attrs.contains(.dim) { fg = fg.blended(with: bg, 0.45) }
+            if c.attrs.contains(.hidden) { fg = bg }
+            else if let h = highlights?[x] { fg = h }
+            var marked = false
+            if rowSelected, let sel = selection, sel.contains(line: stable, col: x) { bg = cc.selBG; bgIsDefault = false }
+            else if !rowMatches.isEmpty, rowMatches.contains(where: { $0.contains(line: stable, col: x) }) {
+                bg = (cc.currentMatch?.contains(line: stable, col: x) ?? false) ? cc.currentMatchBG : cc.matchBG; bgIsDefault = false
+            }
+            else if !rowMarks.isEmpty, let m = rowMarks.last(where: { $0.range.contains(line: stable, col: x) }) {
+                bg = bg.blended(with: Marker.color(m.colorIndex), 0.45); bgIsDefault = false; marked = true // marker pen
+            }
+            let ratio = marked ? max(3, config.minimumContrast) : config.minimumContrast
+            if ratio > 1 { fg = fg.ensuringContrast(against: bg, ratio: ratio) }
+            fgs[x] = fg
+            bgs[x] = bgIsDefault ? nil : bg
+        }
+        return (fgs, bgs)
+    }
+
+    /// Text layer drawing (called by GridView).
+    func drawGrid(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let s = snapshot()
+        terminal.lock.lock()
+        let marks = annotations.isEmpty ? [] : annotations.live(in: terminal)
+        terminal.lock.unlock()
         let defaultBG = s.reverse ? s.fg : s.bg
-        let opacity = config.backgroundOpacity
-
-        ctx.clear(bounds)
-        ctx.setFillColor(defaultBG.nsColor.withAlphaComponent(opacity).cgColor)
-        ctx.fill(bounds)
-        drawBadge(ctx, fg: s.reverse ? s.bg : s.fg)
+        let gpu = metalView != nil
+        if s.reverse && !gpu { // DECSCNM reverse video: the whole screen background flips
+            ctx.setFillColor(defaultBG.nsColor.withAlphaComponent(config.backgroundOpacity).cgColor); ctx.fill(bounds)
+        }
         ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
 
-        let selBG = config.selectionBackground
-        let matchBG = RGB(0x6B, 0x55, 0x1E), currentMatchBG = RGB(0xC9, 0x8E, 0x1A)
-        let currentMatch = searchMatches.indices.contains(searchIndex) ? searchMatches[searchIndex] : nil
+        let cc = colorContext(s, marks: marks)
+        let lw = max(1, round(fontSize / 13))
+        let decorations: CellAttrs = [.underline, .doubleUnderline, .curlyUnderline, .strike, .overline]
 
+        // Record what ends up on screen (see invalidateChangedRows).
+        let frame = Drawn(rows: [], firstStable: s.firstStable, cols: s.cols, cursor: s.cursor?.y, cursorShape: s.cursorShape,
+                          marks: marks.map(\.id), reverse: s.reverse, colors: [s.fg, s.bg, s.cursorColor] + s.palette)
+        var frameRows = s.rows
+        let fullDraw = dirtyRect.contains(gridView.bounds)
+        var partialOK = !fullDraw && drawn.rows.count == s.rows.count && drawn.sameFrame(as: Drawn(rows: s.rows, firstStable: frame.firstStable,
+                          cols: frame.cols, marks: frame.marks, reverse: frame.reverse, colors: frame.colors))
+
+        lastPaintedRowCount = 0
         for (r, row) in s.rows.enumerated() {
             let y = padY + CGFloat(r) * cellH
-            guard NSRect(x: 0, y: y, width: bounds.width, height: cellH).intersects(dirtyRect) else { continue }
+            let rr = rowRect(r, count: s.rows.count)
+            guard rr.intersects(dirtyRect) && gridView.needsToDraw(rr) else {
+                if partialOK { frameRows[r] = drawn.rows[r] }
+                continue
+            }
+            lastPaintedRowCount += 1
             let stable = s.firstStable + r
             let n = min(row.cells.count, s.cols)
-
-            // Resolve per-cell colors once.
-            var fgs = [RGB](repeating: s.fg, count: n)
-            var bgs = [RGB?](repeating: nil, count: n) // nil = default background (transparent-capable)
-            let highlights = config.highlights.isEmpty ? nil : HighlightRule.apply(config.highlights, to: row)
-            for x in 0..<n {
-                let c = row.cells[x]
-                var fg = resolve(c.fg, s, fg: true), bg = resolve(c.bg, s, fg: false)
-                var bgIsDefault = c.bg == .default
-                if c.attrs.contains(.inverse) != s.reverse { swap(&fg, &bg); bgIsDefault = false }
-                if c.attrs.contains(.bold), case .indexed(let i) = c.fg, i < 8 { fg = s.palette[Int(i) + 8] } // bold-is-bright
-                if c.attrs.contains(.dim) { fg = fg.blended(with: bg, 0.45) }
-                if c.attrs.contains(.hidden) { fg = bg }
-                else if let h = highlights?[x] { fg = h }
-                if let sel = selection, sel.contains(line: stable, col: x) { bg = selBG; bgIsDefault = false }
-                else if !searchMatches.isEmpty, searchMatches.contains(where: { $0.contains(line: stable, col: x) }) {
-                    bg = (currentMatch?.contains(line: stable, col: x) ?? false) ? currentMatchBG : matchBG; bgIsDefault = false
-                }
-                fg = fg.ensuringContrast(against: bg, ratio: config.minimumContrast)
-                fgs[x] = fg
-                bgs[x] = bgIsDefault ? nil : bg
-            }
+            // With the Metal renderer, this layer only draws decorations over the GPU text.
+            if gpu && !row.cells[0..<n].contains(where: { !$0.attrs.isDisjoint(with: decorations) || $0.link != 0 }) { continue }
+            let (fgs, bgs) = resolveRow(row, stable: stable, n: n, cc)
 
             // Backgrounds: merge runs of equal color.
             var x = 0
+            if !gpu {
             while x < n {
                 guard let bg = bgs[x] else { x += 1; continue }
                 var e = x + 1
                 while e < n, bgs[e] == bg { e += 1 }
-                ctx.setFillColor(bg.cgColor)
+                ctx.setFillColor(cgColor(bg))
                 // extend edge cells into padding so full-width bars look seamless
                 let x0 = x == 0 ? 0 : padX + CGFloat(x) * cellW
                 let x1 = e == s.cols ? bounds.width : padX + CGFloat(e) * cellW
@@ -292,17 +588,16 @@ final class TerminalView: NSView, NSTextInputClient {
             x = 0
             while x < n {
                 let c = row.cells[x]
-                if c.width == 0 || c.ch == " " { x += 1; continue }
+                if c.width == 0 || c.isSpace { x += 1; continue }
                 let style = fontIndex(c.attrs)
                 let cx = padX + CGFloat(x) * cellW
-                if let a = c.ch.asciiValue, a > 0x20 {
+                if let a = c.ascii, a > 0x20 {
                     var e = x + 1
-                    var str = String(c.ch)
-                    while e < n, let b = row.cells[e].ch.asciiValue, b >= 0x20, row.cells[e].width == 1,
-                          fgs[e] == fgs[x], fontIndex(row.cells[e].attrs) == style {
-                        str.append(row.cells[e].ch); e += 1
+                    while e < n, let b = row.cells[e].ascii, b >= 0x20, row.cells[e].width == 1,
+                          fgs[e] == fgs[x], fontIndex(row.cells[e].attrs) == style { e += 1 }
+                    if !drawGlyphRun(ctx, row, x, e, style: style, color: fgs[x], y: y) {
+                        drawText(ctx, String(row.cells[x..<e].map(\.ch)), font: fonts[style], color: fgs[x], x: cx, y: y)
                     }
-                    drawText(ctx, str, font: fonts[style], color: fgs[x], x: cx, y: y)
                     x = e
                 } else {
                     let rect = CGRect(x: cx, y: y, width: cellW * CGFloat(max(1, c.width)), height: cellH)
@@ -312,13 +607,14 @@ final class TerminalView: NSView, NSTextInputClient {
                     x += 1
                 }
             }
+            } // !gpu
 
             // Decorations
             for x in 0..<n {
                 let c = row.cells[x]
+                guard !c.attrs.isDisjoint(with: decorations) || c.link != 0 else { continue }
                 let cx = padX + CGFloat(x) * cellW
-                let lw = max(1, round(fontSize / 13))
-                ctx.setStrokeColor(fgs[x].cgColor); ctx.setLineWidth(lw)
+                ctx.setStrokeColor(cgColor(fgs[x])); ctx.setLineWidth(lw)
                 if c.attrs.contains(.underline) || c.link != 0 && isHoveredLink(c.link, row: r) {
                     line(ctx, cx, y + ascent + 2, cx + cellW, y + ascent + 2)
                 }
@@ -337,7 +633,18 @@ final class TerminalView: NSView, NSTextInputClient {
             }
         }
 
+        // Cursor rows must be on screen too for a partial frame to be trusted.
+        if partialOK, drawn.cursor != s.cursor?.y {
+            for c in [drawn.cursor, s.cursor?.y].compactMap({ $0 }) {
+                let rr = rowRect(c, count: s.rows.count)
+                if !(rr.intersects(dirtyRect) && gridView.needsToDraw(rr)) { partialOK = false }
+            }
+        }
+        if partialOK, s.cursorShape != drawn.cursorShape { partialOK = false }
+        if fullDraw || partialOK { var f = frame; f.rows = frameRows; drawn = f } else { drawn = Drawn() }
+
         drawBookmarks(ctx, firstStable: s.firstStable, rows: s.rows.count)
+        drawHighlightNoteMarkers(ctx, marks: marks, firstStable: s.firstStable, rows: s.rows.count)
         drawCursor(ctx, s)
         drawPreedit(ctx, s)
         drawUnfocusedDim(ctx, bg: defaultBG)
@@ -369,20 +676,51 @@ final class TerminalView: NSView, NSTextInputClient {
         CTLineDraw(lineRef, ctx)
     }
 
+    /// Fast path for a run of printable ASCII: cached glyph IDs placed exactly on the cell
+    /// grid, drawn with one CTFontDrawGlyphs call (no attributed string / line layout).
+    /// Returns false if the font lacks a glyph, so the caller falls back to CoreText layout.
+    private func drawGlyphRun(_ ctx: CGContext, _ row: Row, _ x0: Int, _ x1: Int, style: Int, color: RGB, y: CGFloat) -> Bool {
+        guard asciiGlyphs.indices.contains(style) else { return false }
+        let table = asciiGlyphs[style]
+        glyphBuf.removeAll(keepingCapacity: true); posBuf.removeAll(keepingCapacity: true)
+        // Positions are in text space; the flipped text matrix negates y.
+        let by = -(y + ascent)
+        for x in x0..<x1 {
+            guard let a = row.cells[x].ascii else { return false }
+            if a == 0x20 { continue }
+            let g = table[Int(a)]
+            if g == 0 { return false }
+            glyphBuf.append(g); posBuf.append(CGPoint(x: padX + CGFloat(x) * cellW, y: by))
+        }
+        guard !glyphBuf.isEmpty else { return true }
+        ctx.textPosition = .zero
+        ctx.setFillColor(cgColor(color))
+        CTFontDrawGlyphs(fonts[style], glyphBuf, posBuf, glyphBuf.count, ctx)
+        return true
+    }
+
     /// Non-ASCII glyphs (often from fallback fonts) are centered in their 1- or 2-cell slot.
+    /// Laid-out lines are cached per (style, text) and take their color from the context.
     private func drawCentered(_ ctx: CGContext, _ str: String, font: CTFont, color: RGB, rect: CGRect) {
-        let attr = NSAttributedString(string: str, attributes: [
-            NSAttributedString.Key(kCTFontAttributeName as String): font,
-            NSAttributedString.Key(kCTForegroundColorAttributeName as String): color.cgColor,
-        ])
-        let l = CTLineCreateWithAttributedString(attr)
-        let w = CGFloat(CTLineGetTypographicBounds(l, nil, nil, nil))
+        let key = "\(fonts.firstIndex { $0 === font } ?? 0)\u{0}\(str)"
+        let (l, w): (CTLine, CGFloat)
+        if let hit = glyphLineCache[key] { (l, w) = hit } else {
+            let attr = NSAttributedString(string: str, attributes: [
+                NSAttributedString.Key(kCTFontAttributeName as String): font,
+                NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String): true,
+            ])
+            l = CTLineCreateWithAttributedString(attr)
+            w = CGFloat(CTLineGetTypographicBounds(l, nil, nil, nil))
+            if glyphLineCache.count > 4096 { glyphLineCache.removeAll() }
+            glyphLineCache[key] = (l, w)
+        }
+        ctx.setFillColor(cgColor(color))
         ctx.textPosition = CGPoint(x: rect.minX + max(0, (rect.width - w) / 2), y: rect.minY + ascent)
         CTLineDraw(l, ctx)
     }
 
-    /// Pixel-perfect box drawing & block elements (Ghostty renders these as
-    /// sprites in src/font/sprite so lines join seamlessly across cells).
+    /// Pixel-perfect box drawing & block elements, drawn as geometry rather than
+    /// font glyphs so lines join seamlessly across cells.
     private func drawSprite(_ ctx: CGContext, _ ch: Character, rect r: CGRect, color: RGB) -> Bool {
         guard let v = ch.unicodeScalars.first?.value, ch.unicodeScalars.count == 1 else { return false }
         ctx.setFillColor(color.cgColor)
@@ -710,6 +1048,7 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        updateHighlightTooltip(event)
         _ = reportMouse(event, button: .none, pressed: true, motion: true)
         let cmd = event.modifierFlags.contains(.command)
         if cmd != hoverCmd { hoverCmd = cmd; needsDisplay = true }
@@ -735,6 +1074,7 @@ final class TerminalView: NSView, NSTextInputClient {
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let m = NSMenu()
+        addHighlightMenuItems(to: m, event: event)
         m.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
         m.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
         m.addItem(.separator())

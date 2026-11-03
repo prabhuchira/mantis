@@ -282,7 +282,7 @@ extension TerminalView {
         a.beginSheetModal(for: w) { [weak self] r in
             guard r == .alertFirstButtonReturn else { return }
             self?.badgeOverride = field.stringValue.isEmpty ? nil : field.stringValue
-            self?.needsDisplay = true
+            self?.redrawAll()
         }
         DispatchQueue.main.async { w.attachedSheet?.makeFirstResponder(field) }
     }

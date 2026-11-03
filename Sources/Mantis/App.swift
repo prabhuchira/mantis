@@ -3,8 +3,7 @@ import Carbon // EnableSecureEventInput
 import UserNotifications
 import MantisCore
 
-/// macOS app runtime (Ghostty: macos/Sources/App + Features/Terminal, i.e. the
-/// "embedded" apprt where Swift owns windows and the core owns terminals).
+/// macOS app runtime: Swift owns windows, the core owns terminals.
 
 enum Notifier {
     static func post(title: String, body: String) {
@@ -21,9 +20,9 @@ enum Notifier {
 }
 
 /// One window = a tree of split panes, each a TerminalView. Tabs are native
-/// NSWindow tabs (Ghostty also uses native macOS tabs).
+/// NSWindow tabs.
 final class TerminalWindowController: NSWindowController, NSWindowDelegate {
-    let config: Config
+    private(set) var config: Config
     private(set) var panes: [TerminalView] = []
     private weak var focused: TerminalView?
 
@@ -42,14 +41,26 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         let tv = makePane()
         w.contentView = tv
         w.setContentSize(tv.preferredContentSize)
-        w.backgroundColor = config.background.nsColor.withAlphaComponent(config.backgroundOpacity)
-        if config.backgroundOpacity < 1 { w.isOpaque = false }
+        applyWindowAppearance()
         w.center()
         w.makeFirstResponder(tv)
         tv.start()
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    private func applyWindowAppearance() {
+        guard let w = window else { return }
+        w.backgroundColor = config.background.nsColor.withAlphaComponent(config.backgroundOpacity)
+        w.isOpaque = config.backgroundOpacity >= 1
+    }
+
+    /// Live-apply new settings to the window and every pane in it.
+    func applyConfig(_ c: Config) {
+        config = c
+        applyWindowAppearance()
+        panes.forEach { $0.applyConfig(c) }
+    }
 
     private func makePane() -> TerminalView {
         let tv = TerminalView(config: config)
@@ -68,7 +79,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         return tv
     }
 
-    // MARK: Splits (Ghostty: SplitTree / split_right, split_down)
+    // MARK: Splits
 
     @objc func splitRight(_ sender: Any?) { split(vertical: true) }
     @objc func splitDown(_ sender: Any?) { split(vertical: false) }
@@ -140,7 +151,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         if let c = window?.contentView { eq(c) }
     }
 
-    // MARK: Close confirmation (Ghostty: confirm-close-surface)
+    // MARK: Close confirmation
 
     private func confirmIfBusy(_ views: [TerminalView], then: @escaping () -> Void) {
         guard views.contains(where: { $0.pty.hasForegroundJob }), let w = window else { then(); return }
@@ -170,9 +181,35 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     @objc override func newWindowForTab(_ sender: Any?) { AppDelegate.shared.newTab(sender) }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSMenuDelegate {
     static var shared: AppDelegate!
     var config = Config.load()
+    lazy var settings: SettingsModel = {
+        let m = SettingsModel()
+        m.onApply = { [weak self] c in self?.applyLive(c) }
+        return m
+    }()
+    private var settingsWindow: SettingsWindowController?
+
+    /// Settings are authoritative once edited: update new-window config and every open pane.
+    func applyLive(_ c: Config) {
+        config = c
+        controllers.forEach { $0.applyConfig(c) }
+    }
+
+    @objc func showSettings(_ sender: Any?) {
+        if settingsWindow == nil { settingsWindow = SettingsWindowController(model: settings) }
+        settingsWindow?.showWindow(nil)
+        settingsWindow?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showSettingsEffects(_ sender: Any?) { settings.tab = 2; showSettings(sender) }
+
+    @objc func selectEffect(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let kind = EffectKind(rawValue: raw) else { return }
+        settings.config.effect = kind // applies live + saves
+    }
     var controllers: [TerminalWindowController] = []
     private(set) var secureInput = false
 
@@ -194,8 +231,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         for c in controllers { c.window?.subtitle = secureInput ? "🔒 Secure Keyboard Entry" : "" }
     }
 
+    // "Go to Highlight" is rebuilt from the focused pane each time it opens.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu.title == "Go to Highlight" else { return }
+        menu.removeAllItems()
+        let items = (NSApp.keyWindow?.firstResponder as? TerminalView)?.highlightMenuItems() ?? []
+        if items.isEmpty {
+            menu.addItem(NSMenuItem(title: "No highlights — select text and press ⌘L", action: nil, keyEquivalent: ""))
+        } else { items.forEach(menu.addItem) }
+    }
+
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(toggleSecureInput(_:)) { item.state = secureInput ? .on : .off }
+        if item.action == #selector(selectEffect(_:)) {
+            item.state = (item.representedObject as? String) == config.effect.rawValue ? .on : .off
+        }
         return true
     }
 
@@ -208,10 +258,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // Headless verification: MANTIS_SNAPSHOT=/path.png renders the first window to PNG and exits.
         if let path = ProcessInfo.processInfo.environment["MANTIS_SNAPSHOT"] {
             let delay = Double(ProcessInfo.processInfo.environment["MANTIS_SNAPSHOT_DELAY"] ?? "") ?? 2.0
+            if let tab = ProcessInfo.processInfo.environment["MANTIS_SNAPSHOT_SETTINGS"].flatMap(Int.init) {
+                settings.tab = tab; showSettings(nil)
+            }
             if ProcessInfo.processInfo.environment["MANTIS_SNAPSHOT_SPLITS"] != nil {
                 c.splitRight(nil); c.splitDown(nil)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                // MANTIS_SNAPSHOT_SETTINGS=<tab index> captures the Settings window instead
+                if let tab = ProcessInfo.processInfo.environment["MANTIS_SNAPSHOT_SETTINGS"].flatMap(Int.init),
+                   let sw = self.settingsWindow?.window?.contentView {
+                    _ = tab
+                    sw.display()
+                    let ok = Self.writePNG(of: sw, to: path)
+                    FileHandle.standardError.write("settings snapshot \(ok ? "written" : "FAILED"): \(path)\n".data(using: .utf8)!)
+                    NSApp.terminate(nil); return
+                }
                 // e.g. MANTIS_SNAPSHOT_ACTIONS=toggleBookmark:,enterHintMode:  (selectors run on the first pane)
                 if let acts = ProcessInfo.processInfo.environment["MANTIS_SNAPSHOT_ACTIONS"], let tv = c.panes.first {
                     for a in acts.split(separator: ",") { tv.perform(NSSelectorFromString(String(a)), with: nil) }
@@ -266,9 +328,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     @objc func reloadConfig(_ sender: Any?) {
-        config = Config.load()
-        if !config.errors.isEmpty { showConfigErrors() }
-        // New surfaces pick up the new config (live-reload of existing ones is on the roadmap).
+        settings.reloadFromDisk() // re-reads the file and live-applies it to every terminal
+        if !settings.config.errors.isEmpty { config = settings.config; showConfigErrors() }
     }
 
     private func showConfigErrors() {
@@ -289,7 +350,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         sub("Mantis", [
             item("About Mantis", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""),
             .separator(),
-            item("Settings…", #selector(openConfig(_:)), ","),
+            item("Settings…", #selector(showSettings(_:)), ","),
+            item("Open Config File…", #selector(openConfig(_:)), ",", [.command, .option]),
             item("Reload Configuration", #selector(reloadConfig(_:)), ",", [.command, .shift]),
             .separator(),
             item("Secure Keyboard Entry", #selector(toggleSecureInput(_:)), ""),
@@ -331,6 +393,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             item("Previous Bookmark", #selector(TerminalView.previousBookmark(_:)), up),
             item("Next Bookmark", #selector(TerminalView.nextBookmark(_:)), down),
             item("Clear Bookmarks", #selector(TerminalView.clearBookmarks(_:)), ""),
+            .separator(),
+            item("Highlight Selection", #selector(TerminalView.highlightSelection(_:)), "l"),
+            { () -> NSMenuItem in
+                let it = NSMenuItem(title: "Highlight With", action: nil, keyEquivalent: "")
+                let m = NSMenu(title: "Highlight With")
+                for (i, name) in Marker.names.enumerated() {
+                    let c = item(name, #selector(TerminalView.highlightWithColor(_:)), "\(i + 1)", [.command, .option])
+                    c.tag = i; c.image = Marker.swatch(i); m.addItem(c)
+                }
+                it.submenu = m
+                return it
+            }(),
+            item("Remove Highlight", #selector(TerminalView.removeHighlightAction(_:)), "l", [.command, .option]),
+            item("Next Highlight", #selector(TerminalView.nextHighlight(_:)), down, [.command, .control]),
+            item("Previous Highlight", #selector(TerminalView.previousHighlight(_:)), up, [.command, .control]),
+            { () -> NSMenuItem in
+                let it = NSMenuItem(title: "Go to Highlight", action: nil, keyEquivalent: "")
+                let m = NSMenu(title: "Go to Highlight")
+                m.delegate = self // filled from the focused pane when opened
+                it.submenu = m
+                return it
+            }(),
+            item("Copy All Highlights (Markdown)", #selector(TerminalView.copyAllHighlights(_:)), "l", [.command, .shift]),
+            item("Clear All Highlights", #selector(TerminalView.clearAllHighlights(_:)), ""),
         ])
         sub("View", [
             item("Increase Font Size", #selector(TerminalView.increaseFontSize(_:)), "="),
@@ -338,6 +424,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             item("Reset Font Size", #selector(TerminalView.resetFontSize(_:)), "0"),
             .separator(),
             item("Set Badge…", #selector(TerminalView.setBadge(_:)), "b", [.command, .option]),
+            { () -> NSMenuItem in
+                let it = NSMenuItem(title: "Effect", action: nil, keyEquivalent: "")
+                let m = NSMenu(title: "Effect")
+                for k in EffectKind.allCases {
+                    let e = NSMenuItem(title: k.title, action: #selector(AppDelegate.selectEffect(_:)), keyEquivalent: "")
+                    e.representedObject = k.rawValue
+                    m.addItem(e)
+                    if k == .none { m.addItem(.separator()) }
+                }
+                m.addItem(.separator())
+                m.addItem(item("Effect Settings…", #selector(AppDelegate.showSettingsEffects(_:)), ""))
+                it.submenu = m
+                return it
+            }(),
             .separator(),
             item("Scroll to Top", #selector(TerminalView.scrollToTop(_:)), String(UnicodeScalar(NSHomeFunctionKey)!)),
             item("Scroll to Bottom", #selector(TerminalView.scrollToBottomAction(_:)), String(UnicodeScalar(NSEndFunctionKey)!)),
@@ -356,7 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
 extension Config {
     static let sampleFile = """
-    # Mantis configuration — syntax mirrors Ghostty: `key = value`
+    # Mantis configuration — syntax: `key = value`
     # font-family = JetBrains Mono
     # font-size = 14
     # background = 14161b

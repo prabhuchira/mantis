@@ -1,10 +1,10 @@
 // swift-tools-version:5.9
 import PackageDescription
 
-// Layering mirrors Ghostty:
-//   CPTY        ~ ghostty/src/pty.c + src/pty.zig      (openpty/forkpty, TIOCSWINSZ)
-//   MantisCore  ~ ghostty/src/terminal (libghostty-vt)  (parser, screen state, encoders) — no UI deps
-//   Mantis      ~ ghostty/macos + src/apprt + renderer  (AppKit shell, threads, drawing)
+// Layering:
+//   CPTY        pty shim                (openpty/forkpty, TIOCSWINSZ)
+//   MantisCore  terminal core           (parser, screen state, encoders) — no UI deps
+//   Mantis      macOS app               (AppKit shell, threads, drawing)
 let package = Package(
     name: "Mantis",
     platforms: [.macOS(.v13)],
@@ -18,5 +18,6 @@ let package = Package(
         .target(name: "MantisCore", swiftSettings: [.unsafeFlags(["-enforce-exclusivity=unchecked"])]),
         .executableTarget(name: "Mantis", dependencies: ["MantisCore", "CPTY"]),
         .testTarget(name: "MantisCoreTests", dependencies: ["MantisCore"]),
+        .testTarget(name: "MantisTests", dependencies: ["Mantis", "MantisCore"]),
     ]
 )

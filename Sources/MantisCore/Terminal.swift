@@ -1,9 +1,8 @@
 import Foundation
 
 /// Terminal state: screens, cursor, modes, scrollback — fed by the Parser.
-/// Equivalent of Ghostty's `src/terminal/Terminal.zig` + `Screen.zig`.
-/// Not thread-safe by itself: callers hold `lock` (Ghostty uses a renderer
-/// state mutex shared between the IO thread and the renderer thread the same way).
+/// Not thread-safe by itself: callers hold `lock`, a state mutex shared between
+/// the IO thread and the renderer thread.
 public final class Terminal: ASCIIRunHandler {
     public enum CursorShape: Equatable { case block, underline, bar }
     public enum MouseTracking: Equatable { case none, x10, normal, button, any }
@@ -65,7 +64,7 @@ public final class Terminal: ASCIIRunHandler {
     public private(set) var hyperlinks: [String] = [""]
     var charsets: [Charset] = [.ascii, .ascii]
     var gl = 0
-    var lastPrinted: Character?
+    var lastPrinted: UInt32?
     /// Bumped every time the visible content may have changed (renderer dirty check).
     public private(set) var generation: UInt64 = 0
 
@@ -74,7 +73,7 @@ public final class Terminal: ASCIIRunHandler {
     public var defaultBG = RGB(0x14, 0x16, 0x1B)
     public var cursorColor = RGB(0xF2, 0xC1, 0x4E)
 
-    // Side effects flow out through callbacks (Ghostty: stream_handler.zig → surface messages).
+    // Side effects flow out through callbacks.
     public var onResponse: (([UInt8]) -> Void)?
     public var onTitle: ((String) -> Void)?
     public var onBell: (() -> Void)?
@@ -82,7 +81,7 @@ public final class Terminal: ASCIIRunHandler {
     public var onWorkingDirectory: ((String) -> Void)?
     public var onNotification: ((String, String) -> Void)?
 
-    private let parser = Parser()
+    let parser = Parser()
 
     public init(cols: Int = 80, rows: Int = 24, scrollbackLimit: Int = 10_000) {
         self.cols = max(1, cols)
@@ -91,7 +90,7 @@ public final class Terminal: ASCIIRunHandler {
         scrollback = RingBuffer(capacity: scrollbackLimit)
         scrollBottom = max(1, rows) - 1
         tabstops = Terminal.defaultTabs(max(1, cols))
-        parser.handler = self
+        parser.setOwner(self)
     }
 
     static func defaultTabs(_ cols: Int) -> [Bool] { (0..<cols).map { $0 % 8 == 0 && $0 != 0 } }
@@ -106,7 +105,7 @@ public final class Terminal: ASCIIRunHandler {
         let sbBefore = scrollback.count &+ droppedLines
         parser.feed(buffer)
         generation &+= 1
-        // Keep a scrolled-back viewport pinned to the same content (like Ghostty).
+        // Keep a scrolled-back viewport pinned to the same content.
         if scrollOffset > 0 {
             let added = (scrollback.count &+ droppedLines) - sbBefore
             scrollOffset = max(0, min(scrollOffset + added, scrollback.count))
@@ -223,6 +222,23 @@ public final class Terminal: ASCIIRunHandler {
             return
         }
 
+        // Emoji sequences that form one character: anything after a ZWJ (👨‍👩‍👧) and the
+        // second half of a regional-indicator pair (🇯🇵) join the previous cell.
+        if scalar.value >= 0x1F000 || scalar.value == 0x2764 {
+            var x = pendingWrap ? cursorX : cursorX - 1
+            if x >= 0, lines[cursorY].cells[x].width == 0, x > 0 { x -= 1 }
+            if x >= 0 {
+                let prev = lines[cursorY].cells[x]
+                func isRI(_ v: UInt32) -> Bool { (0x1F1E6...0x1F1FF).contains(v) }
+                let afterZWJ = prev.code & Cell.clusterFlag != 0 && prev.ch.unicodeScalars.last?.value == 0x200D
+                if afterZWJ || (isRI(scalar.value) && isRI(prev.code)) {
+                    var s = String(prev.ch)
+                    s.unicodeScalars.append(scalar)
+                    if s.count == 1 { lines[cursorY].cells[x].ch = Character(s); return }
+                }
+            }
+        }
+
         if pendingWrap && modes.autowrap {
             lines[cursorY].wrapped = true
             cursorX = 0
@@ -247,12 +263,11 @@ public final class Terminal: ASCIIRunHandler {
         clearWide(row: cursorY, col: cursorX)
         if w == 2 { clearWide(row: cursorY, col: cursorX + 1) }
 
-        let ch = Character(scalar)
-        lines[cursorY].cells[cursorX] = Cell(ch: ch, fg: pen.fg, bg: pen.bg, attrs: pen.attrs, width: UInt8(w), link: pen.link)
+        lines[cursorY].cells[cursorX] = Cell(code: scalar.value, fg: pen.fg, bg: pen.bg, attrs: pen.attrs, width: UInt8(w), link: pen.link)
         if w == 2 {
             lines[cursorY].cells[cursorX + 1] = Cell(fg: pen.fg, bg: pen.bg, attrs: pen.attrs, width: 0, link: pen.link)
         }
-        lastPrinted = ch
+        lastPrinted = scalar.value
 
         if cursorX + w >= cols {
             cursorX = cols - 1
@@ -261,8 +276,6 @@ public final class Terminal: ASCIIRunHandler {
             cursorX += w
         }
     }
-
-    static let asciiChars: [Character] = (0..<128).map { Character(Unicode.Scalar(UInt8($0))) }
 
     /// Batched print for printable ASCII (no width lookup, no combining, in-place row writes).
     public func printASCII(_ run: UnsafeBufferPointer<UInt8>) {
@@ -283,12 +296,11 @@ public final class Terminal: ASCIIRunHandler {
             let x0 = cursorX, x1 = cursorX + count - 1
             clearWide(row: cursorY, col: x0)
             if x1 != x0 || lines[cursorY].cells[x1].width == 2 { clearWide(row: cursorY, col: x1) }
-            let template = Cell(ch: " ", fg: pen.fg, bg: pen.bg, attrs: pen.attrs, width: 1, link: pen.link)
-            let table = Terminal.asciiChars
+            let template = Cell(code: 0x20, fg: pen.fg, bg: pen.bg, attrs: pen.attrs, width: 1, link: pen.link)
             lines[cursorY].cells.withUnsafeMutableBufferPointer { cells in
                 var c = template
                 for k in 0..<count {
-                    c.ch = table[Int(run[i + k])]
+                    c.code = UInt32(run[i + k])
                     cells[x0 + k] = c
                 }
             }
@@ -297,7 +309,7 @@ public final class Terminal: ASCIIRunHandler {
                 cursorX = cols - 1
                 pendingWrap = modes.autowrap
                 if !modes.autowrap && i < n { // without autowrap, the rest overwrites the last column
-                    var c = template; c.ch = Terminal.asciiChars[Int(run[n - 1])]
+                    var c = template; c.code = UInt32(run[n - 1])
                     lines[cursorY].cells[cols - 1] = c
                     i = n
                 }
@@ -305,7 +317,7 @@ public final class Terminal: ASCIIRunHandler {
                 cursorX = x1 + 1
             }
         }
-        lastPrinted = Terminal.asciiChars[Int(run[n - 1])]
+        lastPrinted = UInt32(run[n - 1])
     }
 
     public func execute(_ byte: UInt8) {
@@ -348,7 +360,7 @@ public final class Terminal: ASCIIRunHandler {
         }
     }
 
-    public func csiDispatch(params: [[Int]], intermediates: [UInt8], final: UInt8) {
+    public func csiDispatch(params: CSIParams, intermediates: [UInt8], final: UInt8) {
         func p(_ i: Int, _ def: Int = 0) -> Int {
             guard i < params.count else { return def }
             let v = params[i][0]
@@ -413,7 +425,7 @@ public final class Terminal: ASCIIRunHandler {
         case 0x54: scrollDown(n)                                    // T SD
         case 0x58: eraseChars(n)                                    // X ECH
         case 0x5A: backTab(n)                                       // Z CBT
-        case 0x62: if let c = lastPrinted { for _ in 0..<min(n, cols * rows) { print(c.unicodeScalars.first!) } } // b REP
+        case 0x62: if let c = lastPrinted, let u = Unicode.Scalar(c) { for _ in 0..<min(n, cols * rows) { print(u) } } // b REP
         case 0x63: if p(0) == 0 { respond("\u{1B}[?62;22c") }      // c DA1
         case 0x64: cup(row: p(0, 1), col: cursorX + 1, ignoreOrigin: false) // d VPA
         case 0x67: // g TBC
@@ -503,6 +515,25 @@ public final class Terminal: ASCIIRunHandler {
         if scrollback.append(r) { droppedLines += 1 }
     }
 
+    /// A blank row for the bottom of the screen. Pushing `r` into scrollback hands back the
+    /// evicted oldest row once scrollback is full; its buffer is recycled (no allocation).
+    private func pushScrollbackRecycling(_ r: Row) -> Row {
+        let evicted = scrollback.appendEvicting(r)
+        if scrollback.capacity == 0 || evicted != nil { droppedLines += 1 }
+        var row = evicted ?? Row(cells: [])
+        row.reset(template: blankRow())
+        return row
+    }
+
+    /// Cached blank row for the current width and pen background (rebuilt when either changes).
+    private var blankCache: (cols: Int, bg: TermColor, cells: [Cell]) = (0, .default, [])
+    private func blankRow() -> [Cell] {
+        if blankCache.cols != cols || blankCache.bg != pen.bg {
+            blankCache = (cols, pen.bg, Array(repeating: Cell(code: 0x20, bg: pen.bg), count: cols))
+        }
+        return blankCache.cells
+    }
+
     func setCursor(x: Int, y: Int) {
         cursorX = max(0, min(cols - 1, x))
         cursorY = max(0, min(rows - 1, y))
@@ -534,9 +565,9 @@ public final class Terminal: ASCIIRunHandler {
         let n = min(n, scrollBottom - scrollTop + 1)
         let toHistory = scrollTop == 0 && !modes.altScreen
         for _ in 0..<n {
-            let r = lines.remove(at: scrollTop)
-            if toHistory { pushScrollback(r) }
-            lines.insert(Row(cols: cols, bg: pen.bg), at: scrollBottom)
+            var r = lines.remove(at: scrollTop)
+            if toHistory { r = pushScrollbackRecycling(r) } else { r.reset(template: blankRow()) }
+            lines.insert(r, at: scrollBottom)
         }
     }
 
@@ -710,7 +741,7 @@ public final class Terminal: ASCIIRunHandler {
         }
     }
 
-    private func setPrivateModes(_ params: [[Int]], _ on: Bool) {
+    private func setPrivateModes(_ params: CSIParams, _ on: Bool) {
         for g in params {
             switch g[0] {
             case 1: modes.appCursorKeys = on
@@ -737,11 +768,11 @@ public final class Terminal: ASCIIRunHandler {
         }
     }
 
-    private func setANSIModes(_ params: [[Int]], _ on: Bool) {
+    private func setANSIModes(_ params: CSIParams, _ on: Bool) {
         for g in params where g[0] == 4 { modes.insertMode = on }
     }
 
-    private func sgr(_ g: [[Int]]) {
+    private func sgr(_ g: CSIParams) {
         if g.isEmpty { pen = Pen(link: pen.link); return }
         var i = 0
         while i < g.count {
@@ -790,7 +821,7 @@ public final class Terminal: ASCIIRunHandler {
         }
     }
 
-    private func extendedColor(_ g: [[Int]], _ i: inout Int) -> TermColor? {
+    private func extendedColor(_ g: CSIParams, _ i: inout Int) -> TermColor? {
         let grp = g[i]
         func c8(_ x: Int) -> UInt8 { UInt8(max(0, min(255, x))) }
         if grp.count > 1 { // colon form: 38:5:N or 38:2:[cs]:R:G:B

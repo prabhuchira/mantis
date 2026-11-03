@@ -5,8 +5,8 @@ final class RecordingHandler: ParserHandler {
     var events: [String] = []
     func print(_ s: Unicode.Scalar) { events.append("print(\(s))") }
     func execute(_ b: UInt8) { events.append("exec(\(b))") }
-    func csiDispatch(params: [[Int]], intermediates: [UInt8], final: UInt8) {
-        events.append("csi(\(params),\(String(bytes: intermediates, encoding: .ascii)!),\(Character(Unicode.Scalar(final))))")
+    func csiDispatch(params: CSIParams, intermediates: [UInt8], final: UInt8) {
+        events.append("csi(\(params.groups),\(String(bytes: intermediates, encoding: .ascii)!),\(Character(Unicode.Scalar(final))))")
     }
     func escDispatch(intermediates: [UInt8], final: UInt8) { events.append("esc(\(Character(Unicode.Scalar(final))))") }
     func oscDispatch(_ d: [UInt8]) { events.append("osc(\(String(bytes: d, encoding: .utf8)!))") }
@@ -257,7 +257,7 @@ final class NoopHandler: ParserHandler {
     var n = 0
     func print(_ s: Unicode.Scalar) { n &+= 1 }
     func execute(_ b: UInt8) {}
-    func csiDispatch(params: [[Int]], intermediates: [UInt8], final: UInt8) {}
+    func csiDispatch(params: CSIParams, intermediates: [UInt8], final: UInt8) {}
     func escDispatch(intermediates: [UInt8], final: UInt8) {}
     func oscDispatch(_ d: [UInt8]) {}
 }
@@ -267,9 +267,11 @@ final class ProfileTests: XCTestCase {
         let line = "the quick brown fox jumps over the lazy dog 0123456789"
         let noNL = Array(String(repeating: line, count: 20_000).utf8)
         let withNL = Array(String(repeating: line + "\r\n", count: 20_000).utf8)
+        _ = CharWidth.of("漢") // build the width table outside the timings
         func time(_ label: String, _ bytes: Int, _ f: () -> Void) {
-            let s = Date(); f(); let d = Date().timeIntervalSince(s)
-            print(String(format: "PROFILE %@: %.1f MB/s", label, Double(bytes) / 1_048_576 / d))
+            var best = Double.infinity
+            for _ in 0..<5 { let s = Date(); f(); best = min(best, Date().timeIntervalSince(s)) }
+            print(String(format: "PROFILE %@: %.1f MB/s (best of 5)", label, Double(bytes) / 1_048_576 / best))
         }
         let p = Parser(); let h = NoopHandler(); p.handler = h
         time("parser-only", noNL.count) { noNL.withUnsafeBufferPointer { p.feed($0) } }
@@ -277,5 +279,83 @@ final class ProfileTests: XCTestCase {
         time("terminal no-newline", noNL.count) { t1.feed(noNL) }
         let t2 = Terminal(cols: 120, rows: 40)
         time("terminal with-newline", withNL.count) { t2.feed(withNL) }
+        let sgr = Array(String(repeating: "\u{1B}[38;5;208mwarn\u{1B}[0m \u{1B}[1;32mok\u{1B}[0m line\r\n", count: 20_000).utf8)
+        let t3 = Terminal(cols: 120, rows: 40)
+        time("terminal sgr-heavy", sgr.count) { t3.feed(sgr) }
+        let cjk = Array(String(repeating: "漢字かな한글 é ñ ü line\r\n", count: 20_000).utf8)
+        let t4 = Terminal(cols: 120, rows: 40)
+        time("terminal cjk/unicode", cjk.count) { t4.feed(cjk) }
+    }
+}
+
+final class CellLayoutTests: XCTestCase {
+    /// Cells must stay plain-old-data: copying rows is then a memcpy with no refcounting.
+    func testCellIsCompactPOD() {
+        XCTAssertTrue(_isPOD(Cell.self))
+        XCTAssertLessThanOrEqual(MemoryLayout<Cell>.stride, 20)
+    }
+
+    func testMultiScalarCharactersRoundTrip() {
+        let t = Terminal(cols: 20, rows: 2)
+        t.feed("e\u{301}x 👨‍👩‍👧 🇯🇵")
+        XCTAssertEqual(t.lines[0].cells[0].ch, "é")            // combining mark folded into the cell
+        XCTAssertEqual(t.lines[0].cells[1].ch, "x")
+        XCTAssertEqual(t.lines[0].cells[3].ch, "👨‍👩‍👧")          // ZWJ sequence interned
+        XCTAssertEqual(t.lines[0].cells[3].width, 2)
+        XCTAssertEqual(t.lines[0].cells[6].ch, "🇯🇵")           // regional-indicator pair = one flag
+        XCTAssertEqual(t.cursorX, 8)                               // flag takes 2 cells, not 4
+        XCTAssertEqual(t.lines[0].text.filter { !$0.isWhitespace }, "éx👨‍👩‍👧🇯🇵")
+        XCTAssertEqual(Cell(ch: "👨‍👩‍👧").code, Cell(ch: "👨‍👩‍👧").code) // interned once
+    }
+
+    func testScrollbackRecyclingKeepsContent() {
+        let t = Terminal(cols: 10, rows: 2, scrollbackLimit: 3)
+        for i in 0..<10 { t.feed("\u{1B}[3\(i % 8)mline\(i)\r\n") }
+        XCTAssertEqual(t.scrollback.count, 3)
+        XCTAssertEqual((0..<3).map { t.scrollback[$0].text.trimmingCharacters(in: .whitespaces) }, ["line6", "line7", "line8"])
+        XCTAssertEqual(t.droppedLines, 6)
+        XCTAssertEqual(t.lines[1].text.trimmingCharacters(in: .whitespaces), "") // recycled row was blanked
+        XCTAssertFalse(t.lines[1].wrapped)
+    }
+}
+
+final class ParserFastPathTests: XCTestCase {
+    /// The buffer fast paths (SIMD ASCII scan, inline UTF-8, inline CSI) must produce exactly
+    /// what the byte-at-a-time state machine produces, however the input is chunked.
+    func testFastPathsMatchStateMachine() {
+        var corpus = ""
+        corpus += "plain ascii text that is longer than thirty-two bytes, twice over!\r\n"
+        corpus += "\u{1B}[1;31mred\u{1B}[0m \u{1B}[38;5;208m256\u{1B}[39m \u{1B}[38:2::10:20:30mrgb\u{1B}[m\r\n"
+        corpus += "\u{1B}[?25l\u{1B}[?1049h\u{1B}[2J\u{1B}[5;10Halt screen\u{1B}[?1049l\u{1B}[?25h\r\n"
+        corpus += "漢字かな한글 é ñ ü 🙂🚀 e\u{301} 👨‍👩‍👧 🇯🇵\r\n"
+        corpus += "\u{1B}[4:3mcurly\u{1B}[24m \u{1B}[ q\u{1B}[6 q \u{1B}[>0c \u{1B}[1\u{1B}[0m\r\n" // intermediates, private, interrupted CSI
+        corpus += "bad utf8: \u{1B}[31m"
+        var bytes = Array(corpus.utf8)
+        bytes += [0xC3, 0x28, 0xE2, 0x82, 0x41, 0xF0, 0x9F, 0x98, 0x0A, 0x80, 0xFF, 0x41] // malformed sequences
+        bytes += Array("\u{1B}]0;title\u{07}\u{1B}[3;4r\u{1B}[10;1Hend\u{1B}[r\r\nCSI with ctrl \u{1B}[3\r1m done".utf8)
+        bytes = bytes + bytes + bytes
+
+        func state(_ t: Terminal) -> String {
+            (0..<t.rows).map { r in t.lines[r].cells.map { "\($0.code),\($0.fg),\($0.bg),\($0.attrs.rawValue),\($0.width)" }.joined(separator: "|") }
+                .joined(separator: "\n") + "@\(t.cursorX),\(t.cursorY),\(t.title),\(t.cursorShape),\(t.modes)"
+        }
+        // Reference: the plain state machine, one byte at a time.
+        let ref = Terminal(cols: 40, rows: 12)
+        for b in bytes { ref.parser.advance(b) }
+        let expected = state(ref)
+
+        var rng = SystemRandomNumberGenerator()
+        for trial in 0..<200 {
+            let t = Terminal(cols: 40, rows: 12)
+            var i = 0
+            while i < bytes.count {
+                let len = trial == 0 ? bytes.count : Int.random(in: 1...40, using: &rng)
+                let chunk = Array(bytes[i..<min(bytes.count, i + len)])
+                chunk.withUnsafeBufferPointer { t.feed($0) }
+                i += len
+            }
+            XCTAssertEqual(state(t), expected, "trial \(trial)")
+            if state(t) != expected { break }
+        }
     }
 }

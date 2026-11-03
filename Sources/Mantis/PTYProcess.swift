@@ -3,7 +3,7 @@ import CPTY
 import MantisCore
 
 /// Owns the child process + pty and the IO threads.
-/// Ghostty equivalent: src/termio/Exec.zig (reader thread) + src/termio/Thread.zig (writer thread).
+/// A reader thread drains the pty; a writer thread sends input to it.
 ///
 ///   reader thread : read(master) → lock → terminal.feed() → unlock → onOutput()
 ///   writer queue  : serial queue doing blocking write(master) so big pastes
@@ -32,7 +32,7 @@ final class PTYProcess {
         if let cmd = config.command {
             argv = [shell, "-l", "-c", cmd]
         } else {
-            argv = ["-" + shellName] // leading '-' = login shell (like Terminal.app / Ghostty)
+            argv = ["-" + shellName] // leading '-' = login shell (like Terminal.app)
         }
         var envDict = env
         envDict["TERM"] = "xterm-256color"
@@ -41,6 +41,7 @@ final class PTYProcess {
         envDict["TERM_PROGRAM_VERSION"] = "0.1.0"
         if envDict["LANG"] == nil { envDict["LANG"] = "en_US.UTF-8" }
         envDict.removeValue(forKey: "TERMINFO") // don't inherit a parent terminal's terminfo
+        if config.shellColors { ShellColors.apply(to: &envDict, shell: shell) }
         let cwd = config.workingDirectory ?? NSHomeDirectory()
 
         let cArgv = argv.map { strdup($0) } + [nil]

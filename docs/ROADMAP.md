@@ -13,7 +13,7 @@ scrollback with pinned viewport · ✅ DSR/DA/XTVERSION/DECRQM/OSC 10/11/4 queri
 · ✅ IME/dead keys (NSTextInputClient), option-as-alt · ✅ selection (drag, word, line, rectangular ⌥-drag),
 copy-on-select · ✅ ⌘F search with highlights · ✅ ⌘-click links (OSC 8 + auto-detected URLs) · ✅ native tabs,
 splits (⌘D / ⇧⌘D), close confirmation for running jobs · ✅ unsafe-paste protection · ✅ sprite box drawing &
-block elements · ✅ minimum-contrast · ✅ Ghostty-style config file + CLI flags + `-e`
+block elements · ✅ minimum-contrast · ✅ `key = value` config file + CLI flags + `-e`
 
 ## Added in v0.2 (quick wins)
 ✅ Hint mode (⇧⌘H) for URLs, paths, git hashes and IPs, including soft-wrapped lines · ✅ ⌘-click `file:line:col` →
@@ -22,16 +22,26 @@ with colors (⌥⌘C) · ✅ Editable paste preview, with "Paste as One Line" ·
 ✅ Line bookmarks (⌘B, ⌘↑/⌘↓) · ✅ Secure Keyboard Entry, held only while the app is active · ✅ Badge text
 (`badge = {host}`, ⌥⌘B per pane) · ✅ Dimmed unfocused splits (`unfocused-split-opacity`) · ✅ Cursor trail animation
 
-## 1. Performance (Ghostty's headline feature)
+## Added in v0.3
+✅ Settings window (⌘,) with granular control, live apply and autosave to the config file · ✅ 7 built-in themes ·
+✅ Visual effects (Matrix, CRT, Starfield, Snow, Fireflies, Aurora, Synthwave) on their own layer, with auto-pause ·
+✅ Live config reload (⇧⌘,) applied to open terminals · ✅ Layered pane rendering (background → effect → text)
+
+✅ Session highlights (PDF-style marker): 5 colors, notes, jump/list, Markdown export, text-verified anchors
+
+**Next ideas here:** persist highlights across launches (save with scrollback) · import iTerm2 theme files · per-profile settings (e.g. a red-tinted "prod" profile) ·
+user GLSL/Metal shaders · keybinding editor tab · settings search field
+
+## 1. Performance
 | Feature | Effort | Notes |
 |---|---|---|
-| **Metal renderer** with a glyph texture atlas and instanced cell quads | L | Replace CoreGraphics drawing. Ghostty: `renderer/Metal.zig`, `shaders.metal`, `font/Atlas.zig` |
+| **Metal renderer** with a glyph texture atlas and instanced cell quads | L | Replace CoreGraphics drawing |
 | Dedicated render thread + CVDisplayLink pacing | M | Draw at the display refresh rate, off the main thread |
 | Cache row → CTLine and redraw only dirty rows | S | Large win while staying on CoreGraphics |
-| SIMD UTF-8 decode until the next ESC | M | Ghostty `stream.zig:880`; Swift `SIMD16<UInt8>` |
-| Page-based cell storage (contiguous, style-interned) | L | Ghostty `page.zig`. Cut the per-cell `Character`, use a style ID + grapheme side table |
+| SIMD UTF-8 decode until the next ESC | M | Swift `SIMD16<UInt8>` |
+| Page-based cell storage (contiguous, style-interned) | L | Cut the per-cell `Character`, use a style ID + grapheme side table |
 | Recycle `Row` allocations when scrolling | S | Profiling shows scrolling at about half the speed of plain printing |
-| Benchmarks in CI (`vtebench`-style) | S | Ghostty: `src/benchmark/` |
+| Benchmarks in CI (`vtebench`-style) | S | Track parser and render throughput per commit |
 
 ## 2. Terminal protocol completeness
 | Feature | Effort |
@@ -64,14 +74,13 @@ with colors (⌥⌘C) · ✅ Editable paste preview, with "Paste as One Line" ·
 | Split resize/navigation by direction (⌘⌥ arrows), zoom a split, drag to rearrange | M |
 | Command palette (fuzzy list of all actions) | M |
 | Configurable **keybindings** (`keybind = cmd+shift+e=split_right`) | M |
-| Live config reload applied to existing surfaces | S |
 | Theme library (`theme = …`, light/dark auto-switch) | S |
 | Background blur and image, window padding balance, transparent titlebar styles | S |
 | Window state restoration (tabs, splits, cwd) across launches | M |
 | New tab/split inherits the cwd (OSC 7 is already parsed) | S |
 | Secure keyboard entry, `confirm-close-surface`, bell options (audible/visual/badge) | S |
 | Scrollbar UI, scrollback export to file | S |
-| Inspector (debug overlay of terminal state, keystrokes, cells), like Ghostty's ImGui inspector | M |
+| Inspector (debug overlay of terminal state, keystrokes, cells) | M |
 
 ## 5. Shell integration
 | Feature | Effort |
@@ -85,12 +94,12 @@ with colors (⌥⌘C) · ✅ Editable paste preview, with "Paste as One Line" ·
 | Feature | Effort |
 |---|---|
 | Linux GTK4 frontend over the same `MantisCore` (Swift runs on Linux) | L |
-| `libmantis-vt` C API so other apps can embed the core (like `libghostty-vt`) | M |
+| `libmantis-vt` C API so other apps can embed the core | M |
 | Sparkle auto-update, notarized signed builds, Homebrew cask | S |
-| AppleScript/App Intents/Shortcuts automation (Ghostty ships `Ghostty.sdef` and App Intents) | M |
+| AppleScript/App Intents/Shortcuts automation | M |
 | Accessibility: VoiceOver text exposure (NSAccessibility text area) | M |
 
-## 7. Beyond Ghostty (differentiators)
+## 7. Differentiators
 | Idea | Effort |
 |---|---|
 | AI command assist: explain errors or suggest commands, opt-in, local-first | M |

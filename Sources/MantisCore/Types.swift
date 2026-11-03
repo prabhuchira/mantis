@@ -1,7 +1,6 @@
 import Foundation
 
-/// Core value types for terminal state. (Ghostty equivalents: terminal/page.zig
-/// cells, terminal/style.zig, terminal/color.zig.)
+/// Core value types for terminal state: cells, styles, colors.
 
 public struct RGB: Equatable, Hashable {
     public var r: UInt8, g: UInt8, b: UInt8
@@ -43,8 +42,12 @@ public struct CellAttrs: OptionSet, Hashable {
     public static let overline = CellAttrs(rawValue: 1 << 10)
 }
 
+/// One grid cell. Plain-old-data (no references), so copying rows is a memcpy with no
+/// reference counting.
 public struct Cell: Equatable {
-    public var ch: Character
+    /// A Unicode scalar value, or — with `Cell.clusterFlag` set — an index into
+    /// `Graphemes` for multi-scalar characters (combining marks, ZWJ emoji, flags).
+    public var code: UInt32
     public var fg: TermColor
     public var bg: TermColor
     public var attrs: CellAttrs
@@ -53,12 +56,59 @@ public struct Cell: Equatable {
     /// Index into Terminal.hyperlinks (OSC 8), 0 = none.
     public var link: UInt16
 
+    public static let clusterFlag: UInt32 = 0x8000_0000
+
     public init(ch: Character = " ", fg: TermColor = .default, bg: TermColor = .default,
                 attrs: CellAttrs = [], width: UInt8 = 1, link: UInt16 = 0) {
-        self.ch = ch; self.fg = fg; self.bg = bg; self.attrs = attrs; self.width = width; self.link = link
+        self.init(code: Graphemes.encode(ch), fg: fg, bg: bg, attrs: attrs, width: width, link: link)
     }
 
+    public init(code: UInt32, fg: TermColor = .default, bg: TermColor = .default,
+                attrs: CellAttrs = [], width: UInt8 = 1, link: UInt16 = 0) {
+        self.code = code; self.fg = fg; self.bg = bg; self.attrs = attrs; self.width = width; self.link = link
+    }
+
+    /// The cell's character (decoded on demand; prefer `code`/`ascii` in hot loops).
+    public var ch: Character {
+        get { Graphemes.decode(code) }
+        set { code = Graphemes.encode(newValue) }
+    }
+
+    /// The byte value if this cell holds a single ASCII character.
+    @inline(__always) public var ascii: UInt8? { code < 0x80 ? UInt8(truncatingIfNeeded: code) : nil }
+    @inline(__always) public var isSpace: Bool { code == 0x20 }
+
     public static let blank = Cell()
+}
+
+/// Interned multi-scalar characters. They are rare (a few per screen at most), so a
+/// process-wide table keeps `Cell` at a fixed small size without per-cell allocations.
+public enum Graphemes {
+    private final class Store: @unchecked Sendable {
+        let lock = NSLock()
+        var list: [Character] = []
+        var index: [Character: UInt32] = [:]
+    }
+    private static let store = Store()
+
+    @inline(__always) public static func encode(_ c: Character) -> UInt32 {
+        let scalars = c.unicodeScalars
+        if scalars.count == 1 { return scalars.first!.value }
+        let s = store
+        s.lock.lock(); defer { s.lock.unlock() }
+        if let i = s.index[c] { return i | Cell.clusterFlag }
+        let i = UInt32(s.list.count)
+        s.list.append(c); s.index[c] = i
+        return i | Cell.clusterFlag
+    }
+
+    @inline(__always) public static func decode(_ code: UInt32) -> Character {
+        if code & Cell.clusterFlag == 0 { return Character(Unicode.Scalar(code) ?? "\u{FFFD}") }
+        let s = store
+        s.lock.lock(); defer { s.lock.unlock() }
+        let i = Int(code & ~Cell.clusterFlag)
+        return i < s.list.count ? s.list[i] : "\u{FFFD}"
+    }
 }
 
 public struct Row: Equatable {
@@ -70,6 +120,23 @@ public struct Row: Equatable {
         cells = Array(repeating: Cell(bg: bg), count: cols)
     }
 
+    /// Reset to blank, copying from a prebuilt blank row (one memcpy, no per-cell loop)
+    /// and reusing the existing buffer when the width matches.
+    public mutating func reset(template: [Cell]) {
+        wrapped = false
+        if cells.count == template.count {
+            cells.withUnsafeMutableBufferPointer { dst in
+                template.withUnsafeBufferPointer { src in dst.baseAddress!.update(from: src.baseAddress!, count: src.count) }
+            }
+        } else {
+            cells = template
+        }
+    }
+
+    public mutating func reset(cols: Int, bg: TermColor = .default) {
+        reset(template: Array(repeating: Cell(code: 0x20, bg: bg), count: cols))
+    }
+
     public var text: String {
         var s = ""
         for c in cells where c.width != 0 { s.append(c.ch) }
@@ -77,8 +144,7 @@ public struct Row: Equatable {
     }
 }
 
-/// Fixed-capacity ring buffer used for scrollback (O(1) append/evict —
-/// Ghostty uses a linked list of memory pages in PageList.zig for the same reason).
+/// Fixed-capacity ring buffer used for scrollback (O(1) append/evict).
 public struct RingBuffer<T> {
     private var storage: [T?] = []
     private var head = 0
@@ -100,6 +166,16 @@ public struct RingBuffer<T> {
         storage[head] = x
         head = (head + 1) % capacity
         return true
+    }
+
+    /// Appends, handing back the evicted oldest element (if any) so its storage can be reused.
+    public mutating func appendEvicting(_ x: T) -> T? {
+        guard capacity > 0 else { return x }
+        if count < capacity { append(x); return nil }
+        let old = storage[head].take()
+        storage[head] = x
+        head = (head + 1) % capacity
+        return old
     }
 
     public subscript(i: Int) -> T {
@@ -124,7 +200,21 @@ public struct RingBuffer<T> {
 // MARK: - Character width (simplified wcwidth / East Asian Width)
 
 public enum CharWidth {
-    public static func of(_ s: Unicode.Scalar) -> Int {
+    /// Widths for the whole Basic Multilingual Plane, computed once (a few ms) on first use:
+    /// Unicode property lookups are far too slow to do per printed character.
+    private static let bmp: [UInt8] = (0..<0x10000).map { v in
+        guard let u = Unicode.Scalar(UInt32(v)) else { return 1 } // surrogates never reach us
+        return UInt8(compute(u))
+    }
+
+    @inline(__always) public static func of(_ s: Unicode.Scalar) -> Int {
+        let v = s.value
+        if v >= 0x20 && v < 0x7F { return 1 }
+        if v < 0x10000 { return Int(bmp[Int(v)]) }
+        return compute(s)
+    }
+
+    static func compute(_ s: Unicode.Scalar) -> Int {
         let v = s.value
         if v < 0x20 || (v >= 0x7F && v < 0xA0) { return 0 }
         if v < 0x300 { return 1 }

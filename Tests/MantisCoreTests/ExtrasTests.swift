@@ -9,9 +9,9 @@ final class ExtrasTests: XCTestCase {
     }
 
     func testDetectorKinds() {
-        let m = Detector.find(in: rows("see https://ghostty.org/docs). at 10.0.0.1:8080 in src/app/main.swift:42:7 commit 3f9a2c1d"))
+        let m = Detector.find(in: rows("see https://example.com/docs). at 10.0.0.1:8080 in src/app/main.swift:42:7 commit 3f9a2c1d"))
         XCTAssertEqual(m.map(\.kind), [.url, .ip, .path, .hash])
-        XCTAssertEqual(m.map(\.text), ["https://ghostty.org/docs", "10.0.0.1:8080", "src/app/main.swift:42:7", "3f9a2c1d"])
+        XCTAssertEqual(m.map(\.text), ["https://example.com/docs", "10.0.0.1:8080", "src/app/main.swift:42:7", "3f9a2c1d"])
         XCTAssertEqual(m[0].cols, 4..<28)
     }
 

@@ -1,4 +1,4 @@
-/// Keyboard & mouse encoding (Ghostty: src/input/key_encode.zig, surface_mouse.zig).
+/// Keyboard & mouse encoding.
 /// Pure functions — no AppKit — so they are unit-testable.
 
 public struct KeyMods: OptionSet {
@@ -87,7 +87,7 @@ public enum KeyEncoder {
         return Array(normalized.utf8)
     }
 
-    /// Heuristic used by Ghostty's clipboard-paste-protection: multi-line pastes
+    /// Paste-protection heuristic: multi-line pastes
     /// without bracketed paste can execute commands immediately.
     public static func isUnsafePaste(_ text: String, bracketed: Bool) -> Bool {
         if text.contains("\u{1B}[201~") { return true }

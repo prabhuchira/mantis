@@ -1,7 +1,7 @@
 #!/bin/sh
 # Content for the extras: URLs, file:line, hashes, IPs and log levels.
 printf '\033[1mbuild log\033[0m\n'
-printf '[12:00:01] INFO  fetching https://ghostty.org/docs/config (mirror 10.0.4.12:8443)\n'
+printf '[12:00:01] INFO  fetching https://example.com/docs/config (mirror 10.0.4.12:8443)\n'
 printf '[12:00:02] WARN  deprecated API in Sources/MantisCore/Parser.swift:42:7\n'
 printf '[12:00:03] ERROR type mismatch at Terminal.swift:118\n'
 printf '[12:00:03] ERROR see ./scripts/build-app.sh for packaging\n'
